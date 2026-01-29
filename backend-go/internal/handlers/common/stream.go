@@ -38,6 +38,8 @@ type StreamContext struct {
 	// 低质量渠道处理
 	RequestModel string // 请求中的 model（用于一致性检查）
 	LowQuality   bool   // 是否为低质量渠道
+	// 隐式缓存推断
+	MessageStartInputTokens int // message_start 事件中的 input_tokens（用于推断隐式缓存）
 }
 
 // CollectedUsageData 从流事件中收集的 usage 数据
@@ -196,6 +198,8 @@ func ProcessStreamEvent(
 	// 检测并收集 usage
 	hasUsage, needInputPatch, needOutputPatch, usageData := CheckEventUsageStatus(event, envCfg.EnableResponseLogs && envCfg.ShouldLog("debug"))
 	needPatch := needInputPatch || needOutputPatch
+	// 保存原始 usageData 用于后续 PatchMessageStartInputTokensIfNeeded
+	originalUsageData := usageData
 	if hasUsage {
 		if !ctx.HasUsage {
 			ctx.HasUsage = true
@@ -203,6 +207,14 @@ func ProcessStreamEvent(
 			if envCfg.EnableResponseLogs && envCfg.ShouldLog("debug") && needPatch && !IsMessageDeltaEvent(event) {
 				log.Printf("[Messages-Stream-Token] 检测到虚假值, 延迟到流结束修补")
 			}
+		}
+		// 记录 message_start 中的 input_tokens（用于后续推断隐式缓存）
+		// 注意：message_start 的 input_tokens 是请求总 token，不应累积到 CollectedUsage.InputTokens
+		// CollectedUsage.InputTokens 应该只记录 message_delta 的最终计费值
+		if IsMessageStartEvent(event) && usageData.InputTokens > 0 && ctx.MessageStartInputTokens == 0 {
+			ctx.MessageStartInputTokens = usageData.InputTokens
+			// 清零 usageData.InputTokens，避免被 updateCollectedUsage 累积
+			usageData.InputTokens = 0
 		}
 		// 累积收集 usage 数据
 		updateCollectedUsage(&ctx.CollectedUsage, usageData)
@@ -238,8 +250,9 @@ func ProcessStreamEvent(
 	}
 
 	// 处理 message_start 事件：尽早补全 input_tokens（部分客户端只读取首个 usage 来累计）
+	// 注意：使用 originalUsageData 而非被清零后的 usageData，避免误判
 	if hasUsage {
-		eventToSend = PatchMessageStartInputTokensIfNeeded(eventToSend, requestBody, needInputPatch, usageData, envCfg.EnableResponseLogs && envCfg.ShouldLog("debug"), ctx.LowQuality)
+		eventToSend = PatchMessageStartInputTokensIfNeeded(eventToSend, requestBody, needInputPatch, originalUsageData, envCfg.EnableResponseLogs && envCfg.ShouldLog("debug"), ctx.LowQuality)
 	}
 
 	if ctx.NeedTokenPatch && HasEventWithUsage(event) {
@@ -249,9 +262,16 @@ func ProcessStreamEvent(
 				ctx.CollectedUsage.CacheCreation5mInputTokens > 0 ||
 				ctx.CollectedUsage.CacheCreation1hInputTokens > 0
 
+			// 检测隐式缓存信号：message_start 的 input_tokens 远大于最终值
+			// 这种情况下不应该用本地估算值覆盖，因为低 input_tokens 是缓存命中的正常结果
+			hasImplicitCacheSignal := ctx.MessageStartInputTokens > 0 &&
+				ctx.CollectedUsage.InputTokens > 0 &&
+				ctx.MessageStartInputTokens > ctx.CollectedUsage.InputTokens
+
 			inputTokens := ctx.CollectedUsage.InputTokens
 			estimatedInputTokens := utils.EstimateRequestTokens(requestBody)
-			if !hasCacheTokens && inputTokens < 10 && estimatedInputTokens > inputTokens {
+			// 仅在无缓存信号（显式或隐式）且 input_tokens 异常小时才用估算值修补
+			if !hasCacheTokens && !hasImplicitCacheSignal && inputTokens < 10 && estimatedInputTokens > inputTokens {
 				inputTokens = estimatedInputTokens
 			}
 
@@ -313,6 +333,41 @@ func updateCollectedUsage(collected *CollectedUsageData, usageData CollectedUsag
 	}
 }
 
+// inferImplicitCacheRead 推断隐式缓存读取
+//
+// 当 message_start 中的 input_tokens 与 message_delta 中的最终 input_tokens 存在显著差异时，
+// 差额可能是上游 prompt caching 命中但未明确返回 cache_read_input_tokens 的情况。
+// 触发条件：差额 > 10% 或差额 > 10000 tokens，且上游未返回 cache_read_input_tokens。
+func inferImplicitCacheRead(ctx *StreamContext, enableLog bool) {
+	// 前置条件检查
+	if ctx.MessageStartInputTokens == 0 || ctx.CollectedUsage.InputTokens == 0 {
+		return
+	}
+
+	// 上游已明确返回 cache_read，无需推断
+	if ctx.CollectedUsage.CacheReadInputTokens > 0 {
+		return
+	}
+
+	// 计算差额
+	diff := ctx.MessageStartInputTokens - ctx.CollectedUsage.InputTokens
+	if diff <= 0 {
+		return
+	}
+
+	// 计算差额比例
+	ratio := float64(diff) / float64(ctx.MessageStartInputTokens)
+
+	// 触发条件：差额 > 10% 或差额 > 10000 tokens
+	if ratio > 0.10 || diff > 10000 {
+		ctx.CollectedUsage.CacheReadInputTokens = diff
+		if enableLog {
+			log.Printf("[Messages-Stream-Token] 推断隐式缓存: message_start=%d, final=%d, cache_read=%d (%.1f%%)",
+				ctx.MessageStartInputTokens, ctx.CollectedUsage.InputTokens, diff, ratio*100)
+		}
+	}
+}
+
 // logStreamCompletion 记录流完成日志
 func logStreamCompletion(ctx *StreamContext, envCfg *config.EnvConfig, startTime time.Time) *types.Usage {
 	if envCfg.EnableResponseLogs {
@@ -332,6 +387,9 @@ func logStreamCompletion(ctx *StreamContext, envCfg *config.EnvConfig, startTime
 	if envCfg.IsDevelopment() {
 		logSynthesizedContent(ctx)
 	}
+
+	// 推断隐式缓存读取
+	inferImplicitCacheRead(ctx, envCfg.EnableResponseLogs && envCfg.ShouldLog("debug"))
 
 	// 将累积的 usage 数据转换为 *types.Usage
 	var usage *types.Usage

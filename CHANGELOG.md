@@ -4,6 +4,26 @@
 
 ---
 
+## [Unreleased]
+
+### 新增
+
+- **隐式缓存读取推断** - 当上游未明确返回 `cache_read_input_tokens` 但存在显著 token 差异时，自动推断缓存命中
+  - 检测 `message_start` 与 `message_delta` 事件中 `input_tokens` 的差异
+  - 触发条件：差额 > 10% 或差额 > 10000 tokens
+  - 将差额自动填充到 `CacheReadInputTokens` 字段，使 token 统计更准确
+  - 新增 `StreamContext.MessageStartInputTokens` 字段记录初始 token 数
+  - 新增 `inferImplicitCacheRead()` 函数在流结束时执行推断
+  - **关键修复**：
+    - `message_start` 的 `input_tokens` 不再累积到 `CollectedUsage.InputTokens`，确保差额计算正确
+    - 使用 `originalUsageData` 传递给 `PatchMessageStartInputTokensIfNeeded`，避免误判
+    - Token 修补逻辑增加隐式缓存信号检测，避免覆盖缓存命中场景下的正确低值
+  - 涉及文件：
+    - `backend-go/internal/handlers/common/stream.go` - 核心逻辑实现
+    - `backend-go/internal/handlers/common/stream_test.go` - 单元测试（11 个边界场景）
+
+---
+
 ## [v2.5.10] - 2026-01-26
 
 ### 新增

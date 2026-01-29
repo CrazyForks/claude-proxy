@@ -163,3 +163,111 @@ func TestPatchMessageStartInputTokensIfNeeded(t *testing.T) {
 		}
 	})
 }
+
+// TestInferImplicitCacheRead 测试隐式缓存推断逻辑
+func TestInferImplicitCacheRead(t *testing.T) {
+	tests := []struct {
+		name                    string
+		messageStartInputTokens int
+		collectedInputTokens    int
+		existingCacheRead       int
+		wantCacheRead           int
+	}{
+		{
+			name:                    "large diff ratio (>10%) should infer cache",
+			messageStartInputTokens: 100000,
+			collectedInputTokens:    20000,
+			existingCacheRead:       0,
+			wantCacheRead:           80000,
+		},
+		{
+			name:                    "large diff value (>10k) should infer cache",
+			messageStartInputTokens: 50000,
+			collectedInputTokens:    38000,
+			existingCacheRead:       0,
+			wantCacheRead:           12000,
+		},
+		{
+			name:                    "small diff should not infer cache",
+			messageStartInputTokens: 10000,
+			collectedInputTokens:    9500,
+			existingCacheRead:       0,
+			wantCacheRead:           0,
+		},
+		{
+			name:                    "existing cache_read should not be overwritten",
+			messageStartInputTokens: 100000,
+			collectedInputTokens:    20000,
+			existingCacheRead:       50000,
+			wantCacheRead:           50000,
+		},
+		{
+			name:                    "zero message_start should not infer",
+			messageStartInputTokens: 0,
+			collectedInputTokens:    20000,
+			existingCacheRead:       0,
+			wantCacheRead:           0,
+		},
+		{
+			name:                    "zero collected should not infer",
+			messageStartInputTokens: 100000,
+			collectedInputTokens:    0,
+			existingCacheRead:       0,
+			wantCacheRead:           0,
+		},
+		{
+			name:                    "negative diff should not infer",
+			messageStartInputTokens: 10000,
+			collectedInputTokens:    15000,
+			existingCacheRead:       0,
+			wantCacheRead:           0,
+		},
+		{
+			name:                    "exactly 10% diff should not infer",
+			messageStartInputTokens: 10000,
+			collectedInputTokens:    9000,
+			existingCacheRead:       0,
+			wantCacheRead:           0,
+		},
+		{
+			name:                    "just over 10% diff should infer",
+			messageStartInputTokens: 10000,
+			collectedInputTokens:    8900,
+			existingCacheRead:       0,
+			wantCacheRead:           1100,
+		},
+		{
+			name:                    "10k diff but ratio <10% should infer (diff > 10k takes precedence)",
+			messageStartInputTokens: 150000,
+			collectedInputTokens:    139000,
+			existingCacheRead:       0,
+			wantCacheRead:           11000,
+		},
+		{
+			name:                    "diff exactly 10k with ratio <10% should not infer",
+			messageStartInputTokens: 150000,
+			collectedInputTokens:    140000,
+			existingCacheRead:       0,
+			wantCacheRead:           0,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := &StreamContext{
+				MessageStartInputTokens: tt.messageStartInputTokens,
+				CollectedUsage: CollectedUsageData{
+					InputTokens:          tt.collectedInputTokens,
+					CacheReadInputTokens: tt.existingCacheRead,
+				},
+			}
+
+			inferImplicitCacheRead(ctx, false)
+
+			if ctx.CollectedUsage.CacheReadInputTokens != tt.wantCacheRead {
+				t.Errorf("CacheReadInputTokens = %d, want %d",
+					ctx.CollectedUsage.CacheReadInputTokens, tt.wantCacheRead)
+			}
+		})
+	}
+}
